@@ -53,7 +53,7 @@ def equal_lr(module, name='weight'):
     return module
 
 class EqualConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size = 3, stride = 1, padding = 1):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         super().__init__()
 
         conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
@@ -140,8 +140,6 @@ class NoiseInjection(nn.Module):
         self.weight = nn.Parameter(torch.zeros(1, channel, 1, 1))
 
     def forward(self, image, noise):
-        #print(image.size())
-        #print(noise.size())
         return image + self.weight * noise  # broadcast automatically?
 
 
@@ -185,7 +183,7 @@ class StyleBlock(nn.Module):
             self.conv1 = ConstantInput(channel=in_channel, size=4)
         else:
             self.conv1 = nn.Sequential(
-                F.interpolate(scale_factor=2, mode='bilinear'),
+                nn.Upsample(scale_factor=2, mode='bilinear'),
                 EqualConv2d(in_channel, out_channel, kernel_size, stride, padding),
             )
 
@@ -193,7 +191,7 @@ class StyleBlock(nn.Module):
         self.lrelu1 = nn.LeakyReLU(0.2)
         self.AdaIN1 = AdaptiveInstanceNorm(out_channel, style_dim)
 
-        self.conv2 = nn.Conv2d(in_channel, out_channel, kernel_size, stride, padding)
+        self.conv2 = nn.Conv2d(out_channel, out_channel, kernel_size, stride, padding)
         self.noiseInject2 = equal_lr(NoiseInjection(channel=out_channel))
         self.lrelu2 = nn.LeakyReLU(0.2)
         self.AdaIN2 = AdaptiveInstanceNorm(out_channel, style_dim)
@@ -232,15 +230,15 @@ class MappingNetwork(nn.Module):
         return self.style(input)
 
 
-class Generator(nn.Module):
-    def __init__(self):
+class StyledGenerator(nn.Module):
+    def __init__(self, w_dim=512):
         super().__init__()
 
-        self.style = MappingNetwork(z_dim=512, w_dim=512, n_mlp=8)
+        self.style = MappingNetwork(z_dim=512, w_dim=w_dim, n_mlp=8)
 
         self.progressive = nn.ModuleList(
             [
-                StyleBlock(in_channel=512, out_channel= 512, kernel_size=3,stride = 1,padding = 1,style_dim=512,resolution = 4),
+                StyleBlock(in_channel=512, out_channel= 512, kernel_size=3, stride=1, padding=1, style_dim=512, resolution=4),
                 StyleBlock(512, 512, 3, 1, 1, 512, 8),
                 StyleBlock(512, 512, 3, 1, 1, 512, 16),
                 StyleBlock(512, 512, 3, 1, 1, 512, 32),
@@ -254,15 +252,15 @@ class Generator(nn.Module):
         )
         self.to_rgb = nn.ModuleList(   # no activation function
             [
-                EqualConv2d(in_channels=512, out_channels=3, kernel_size=1),  #4
-                EqualConv2d(512, 3, 1),  #8
-                EqualConv2d(512, 3, 1),  #16
-                EqualConv2d(512, 3, 1),  #32
-                EqualConv2d(256, 3, 1),  #64
-                EqualConv2d(128, 3, 1),  #128
-                EqualConv2d(64, 3, 1),  #256
-                EqualConv2d(32, 3, 1),  #512
-                EqualConv2d(16, 3, 1),  #1024
+                EqualConv2d(in_channels=512, out_channels=3, kernel_size=1, stride=1, padding=0),  #4
+                EqualConv2d(512, 3, 1, 1, 0),  #8
+                EqualConv2d(512, 3, 1, 1, 0),  #16
+                EqualConv2d(512, 3, 1, 1, 0),  #32
+                EqualConv2d(256, 3, 1, 1, 0),  #64
+                EqualConv2d(128, 3, 1, 1, 0),  #128
+                EqualConv2d(64, 3, 1, 1, 0),  #256
+                EqualConv2d(32, 3, 1, 1, 0),  #512
+                EqualConv2d(16, 3, 1, 1, 0),  #1024
             ]
         )
 
@@ -288,7 +286,7 @@ class Generator(nn.Module):
         if len(z_codes) == 1:
             inject_idx = len(self.progressive)  # no injection
         elif len(z_codes) == 2:
-            inject_idx = random.sample(list(range(step)), 1)
+            inject_idx = random.randint(0, step)
         else:
             raise NotImplementedError('too many z_codes')
 
@@ -318,14 +316,15 @@ class Generator(nn.Module):
             # for residual connection
             out_prev = out
             # class StyleBlock
-            out = style_block(input= out, style = style_step, noise = noises[i])
+            out = style_block(input=out, style=style_step, noise=noises[i])
 
             # last layer
             if i == step:
                 out = to_rgb(out)
                 # residual connection from PG-GAN
                 if i > 0 and 0 <= alpha < 1:
-                    skip = to_rgb(F.interpolate(out_prev, scale_factor = 2, mode='bilinear'))
+                    # channel error if just to_rgb
+                    skip = self.to_rgb[i - 1](F.interpolate(out_prev, scale_factor=2, mode='bilinear'))
                     out = alpha * out + (1-alpha) * skip
 
                 break
@@ -342,27 +341,28 @@ class DownBlock(nn.Module):
                  kernel_size2=None,
                  padding2=None):
         super().__init__()
-        layers = []
 
-        kernel2 = kernel_size2
-        pad2 = padding2
+
+        kernel2 = kernel_size
+        pad2 = padding
         # for last conv layer of D
         if kernel_size2 is not None:
             kernel2 = kernel_size2
         if padding2 is not None:
             pad2 = padding2
 
-        layers.append(
+        self.block = nn.Sequential(
             EqualConv2d(in_channel, out_channel, kernel_size, stride, padding),
             nn.LeakyReLU(0.2),
             EqualConv2d(out_channel, out_channel, kernel2, stride, pad2),
-            F.interpolate(scale_factor=0.5, mode='bilinear'),
-            nn.LeakyReLU(0.2)
+            nn.AvgPool2d(2),
+            nn.LeakyReLU(0.2),
         )
-        self.block = nn.Sequential(*layers)
+# nn.Upsample(scale_factor=0.5, mode='bilinear')
 
     def forward(self, input):
-        return self.block(input)
+        out = self.block(input)
+        return out
 
 
 class Discriminator(nn.Module):
@@ -379,12 +379,12 @@ class Discriminator(nn.Module):
                 DownBlock(512, 512, 3, 1, 1),  # 16
                 DownBlock(512, 512, 3, 1, 1),  # 8
                 DownBlock(512, 512, 3, 1, 1),  # 4
-                DownBlock(512, 512, 3, 1, 1, kernel_size2=4, padding2=0),  # 1
+                DownBlock(513, 512, 3, 1, 1, kernel_size2=4, padding2=0),  # 1 , 513 due to minibatch standard deviation
             ]
 
         )
         def make_from_rgb(out_channel):
-            return nn.Sequential(EqualConv2d(3, out_channel, 1), nn.LeakyReLU(0.2))
+            return nn.Sequential(EqualConv2d(3, out_channel, 1, 1, 0), nn.LeakyReLU(0.2))
 
         self.from_rgb = nn.ModuleList(
             [
@@ -408,24 +408,27 @@ class Discriminator(nn.Module):
         for i in range(step + 1):
             # first layer
             if i == 0:
+
                 out = self.from_rgb[self.n_layer - step - 1](input)
                 out = self.progression[self.n_layer - step - 1](out)
 
                 if 0 <= alpha < 1:
                     skip_input = F.interpolate(input, scale_factor=0.5, mode='bilinear')
-                    skip_input = self.from_rgb[self.n_layer - step](skip_input)
+                    skip_input = self.from_rgb[self.n_layer - step](skip_input)  # if with -1, maybe channel problem
                     out = alpha * out + (1 - alpha) * skip_input
+
                 continue
 
-            # last layer, minibatch standard deviation from PG-GAN
+            # second last layer, minibatch standard deviation from PG-GAN, 4x4
             elif i == step:
                 out_std = torch.sqrt(out.var(0, unbiased=False) + 1e-8)
                 mean_std = out_std.mean()
                 mean_std = mean_std.expand(out.size(0), 1, 4, 4)
+
                 out = torch.cat([out, mean_std], 1)
 
-            out = self.progression[self.n_layer - step - 1 + i](out) # batchx512x1x1
+            out = self.progression[self.n_layer - step - 1 + i](out)
 
-        out = out.squeeze(2).sequeeze(2) # batchx512
+        out = out.squeeze(2).squeeze(2) # batchx512
 
         return self.linear(out)
